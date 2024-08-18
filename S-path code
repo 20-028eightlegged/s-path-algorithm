@@ -1,0 +1,251 @@
+import folium
+import serial
+import pynmea
+from folium import Polygon
+from folium.plugins import AntPath
+from geopy.distance import geodesic
+
+# Movement commands for the robot
+movement_commands = {
+    "up": b"forward\n",
+    "left": b"left\n",
+    "right": b"right\n",
+    "down": b"backward\n",
+    "stop": b"close\n"
+}
+
+# Initialize the serial port for communication with the robot
+serial_port = serial.Serial("/dev/ttyUSB0", 9600, timeout=1)
+
+
+def send_command(command):
+    """
+    Sends a movement command to the robot.
+
+    Args:
+        command (str): Movement command (e.g., "up", "down", "left", "right", "stop").
+    """
+    if command in movement_commands:
+        serial_port.write(movement_commands[command])
+    else:
+        print(f"Unknown command: {command}")
+
+
+def parseGPS():
+    """
+    Reads GPS data from a serial port and returns the latitude and longitude.
+
+    Returns:
+        tuple: A tuple containing the latitude and longitude.
+    """
+    serialPort = serial.Serial("/dev/ttyAMA0", 9600, timeout=0.5)
+    try:
+        while True:
+            data = serialPort.readline().decode('ascii', errors='replace')
+            if 'GGA' in data:
+                try:
+                    msg = pynmea2.parse(data)
+                    return msg.latitude, msg.longitude
+                except pynmea2.ParseError:
+                    pass
+    except KeyboardInterrupt:
+        print("Data collection stopped.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    return 0, 0
+
+
+def create_map_with_path(corners, initial_location, n=10, internal_offset_lon=0.00001):
+    """
+    Creates an interactive map using Folium that displays a rectangular area
+    defined by four corners and a zigzag path starting from the initial location.
+
+    Parameters:
+    corners (list of tuples): A list of four (latitude, longitude) tuples defining the rectangle.
+    initial_location (tuple): A (latitude, longitude) tuple for the current location.
+    n (int): Number of parallel lines for the zigzag path. Default is 10.
+    internal_offset_lon (float): Offset for internal lines to avoid overlapping. Default is 0.00001.
+
+    Returns:
+    list: A list of coordinates representing the zigzag path.
+    """
+    lat1, lon1 = corners[0]  # Bottom-left corner
+    lat2, lon2 = corners[1]  # Bottom-right corner
+    lat3, lon3 = corners[2]  # Top-left corner
+    lat4, lon4 = corners[3]  # Top-right corner
+
+    distances = {
+        "Bottom-left": geodesic(initial_location, [lat1, lon1]).meters,
+        "Bottom-right": geodesic(initial_location, [lat2, lon2]).meters,
+        "Top-left": geodesic(initial_location, [lat3, lon3]).meters,
+        "Top-right": geodesic(initial_location, [lat4, lon4]).meters
+    }
+
+    nearest_corner_name = min(distances, key=distances.get)
+    nearest_corner_coords = {
+        "Bottom-left": [lat1, lon1],
+        "Bottom-right": [lat2, lon2],
+        "Top-left": [lat3, lon3],
+        "Top-right": [lat4, lon4]
+    }[nearest_corner_name]
+
+    lat_min = min(lat1, lat3)
+    lat_max = max(lat1, lat3)
+    lon_min = min(lon1, lon2)
+    lon_max = max(lon1, lon2)
+    lat_spacing = (lat_max - lat_min) / (n - 1)
+
+    map_center = [(lat_min + lat_max) / 2, (lon_min + lon_max) / 2]
+    m = folium.Map(location=map_center, zoom_start=10)
+
+    folium.Marker([lat1, lon1], popup="Bottom-left corner").add_to(m)
+    folium.Marker([lat2, lon2], popup="Bottom-right corner").add_to(m)
+    folium.Marker([lat3, lon3], popup="Top-left corner").add_to(m)
+    folium.Marker([lat4, lon4], popup="Top-right corner").add_to(m)
+
+    initial_marker = folium.Marker(
+        initial_location,
+        popup="Initial location",
+        icon=folium.Icon(color='green')
+    )
+    initial_marker.add_to(m)
+
+    nearest_marker = folium.Marker(
+        nearest_corner_coords,
+        popup=f"Nearest corner: {nearest_corner_name}",
+        icon=folium.Icon(color='blue')
+    )
+    nearest_marker.add_to(m)
+
+    line_coords = [initial_location, nearest_corner_coords]
+    folium.PolyLine(line_coords, color='purple', weight=3, opacity=0.8).add_to(m)
+
+    bounding_box = Polygon(
+        locations=[[lat1, lon1], [lat2, lon2], [lat4, lon4], [lat3, lon3]],
+        color='black',
+        fill=True,
+        fill_opacity=0.1
+    )
+    bounding_box.add_to(m)
+
+    zigzag_path = []
+    start_lat, start_lon = nearest_corner_coords
+
+    if nearest_corner_name in ["Top-left", "Top-right"]:
+        for i in range(n):
+            lat = lat_max - i * lat_spacing
+            if lat < lat_min:
+                lat = lat_min
+
+            if (start_lon == lon1 and i % 2 == 0) or (start_lon == lon2 and i % 2 != 0):
+                zigzag_path.append([lat, lon_min + internal_offset_lon])
+                zigzag_path.append([lat, lon_max - internal_offset_lon])
+            else:
+                zigzag_path.append([lat, lon_max - internal_offset_lon])
+                zigzag_path.append([lat, lon_min + internal_offset_lon])
+    else:
+        for i in range(n):
+            lat = lat_min + i * lat_spacing
+            if lat > lat_max:
+                lat = lat_max
+
+            if (start_lon == lon1 and i % 2 == 0) or (start_lon == lon2 and i % 2 != 0):
+                zigzag_path.append([lat, lon_min + internal_offset_lon])
+                zigzag_path.append([lat, lon_max - internal_offset_lon])
+            else:
+                zigzag_path.append([lat, lon_max - internal_offset_lon])
+                zigzag_path.append([lat, lon_min + internal_offset_lon])
+
+    if zigzag_path[-1][1] > lon_max:
+        zigzag_path[-1][1] = lon_max
+    if zigzag_path[-1][1] < lon_min:
+        zigzag_path[-1][1] = lon_min
+
+    folium.PolyLine(zigzag_path, color='red').add_to(m)
+
+    start_marker = folium.Marker(
+        [zigzag_path[0][0], zigzag_path[0][1]],
+        popup="Start of Zigzag Path",
+        icon=folium.Icon(color='orange')
+    )
+    start_marker.add_to(m)
+
+    end_marker = folium.Marker(
+        [zigzag_path[-1][0], zigzag_path[-1][1]],
+        popup="End of Zigzag Path",
+        icon=folium.Icon(color='red')
+    )
+    end_marker.add_to(m)
+
+    ant_path_coords = [initial_location] + zigzag_path
+    AntPath(
+        locations=ant_path_coords,
+        dash_array=[20, 20],
+        delay=1000,
+        color='blue',
+        pulse_color='red'
+    ).add_to(m)
+
+    m.save("zigzag_path.html")
+    return zigzag_path
+
+
+def move_to_waypoint(waypoint):
+    """
+    Moves the robot towards a specified waypoint using serial communication and GPS data.
+
+    Parameters:
+    waypoint (tuple): The target (latitude, longitude) to move towards.
+    """
+    while True:
+        current_lat, current_lon = parseGPS()
+
+        distance_to_waypoint = geodesic((current_lat, current_lon), waypoint).meters
+
+        if distance_to_waypoint < 2:  # Threshold to consider reaching the waypoint
+            print(f"Reached waypoint: {waypoint}")
+            break
+
+        if current_lat < waypoint[0]:
+            send_command("up")
+        elif current_lat > waypoint[0]:
+            send_command("down")
+        elif current_lon < waypoint[1]:
+            send_command("right")
+        elif current_lon > waypoint[1]:
+            send_command("left")
+
+    send_command("stop")
+
+
+def move_along_path(path):
+    """
+    Moves the robot along a path using serial communication and GPS data.
+
+    Parameters:
+    path (list of tuples): The path coordinates, including the initial to start and zigzag path.
+    """
+    for waypoint in path:
+        move_to_waypoint(waypoint)
+
+    send_command("stop")
+    print("Finished path.")
+
+
+# Get user input for the four corners of the area
+defined_corners = [
+    get_coordinate_input("Enter the Bottom-left corner (lat,lon): "),
+    get_coordinate_input("Enter the Bottom-right corner (lat,lon): "),
+    get_coordinate_input("Enter the Top-left corner (lat,lon): "),
+    get_coordinate_input("Enter the Top-right corner (lat,lon): ")
+]
+
+# Get the initial location from the first GPS reading
+current_location = parseGPS()
+
+# Create the zigzag path and visualize it on a map
+zigzag_path = create_map_with_path(defined_corners, current_location, n=10, internal_offset_lon=0.00001)
+
+# Move the robot along the generated path
+move_along_path(zigzag_path)
