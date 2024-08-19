@@ -1,0 +1,529 @@
+import os
+import cv2
+import time
+import base64
+import serial
+import warnings
+import requests
+import threading
+import RPi.GPIO as GPIO
+from ultralytics import YOLO
+from datetime import datetime
+from geopy.geocoders import Nominatim
+
+warnings.simplefilter("ignore")
+
+TRIG_PIN = 23
+ECHO_PIN = 24
+
+ser = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
+ser.reset_input_buffer()
+
+previous = ""
+
+movement_commands = {
+    "up": b"forward\n",
+    "left": b"left\n",
+    "right": b"right\n",
+    "down": b"backward\n",
+    "Stop": b"close\n"
+}
+
+stop_robot_flag = threading.Event()
+stop_manual_flag = threading.Event()
+stop_automatic_flag = threading.Event()
+
+robot_thread = None
+camera_thread = None
+manual_thread = None
+cap = None
+lock = threading.Lock()
+
+robotPath = [
+    {'move': 'up', 'sleep': 9},
+    {'move': 'right', 'sleep': 4},
+    {'move': 'up', 'sleep': 5},
+    {'move': 'right', 'sleep': 4},
+    {'move': 'up', 'sleep': 9},
+    {'move': 'left', 'sleep': 4},
+    {'move': 'up', 'sleep': 5},
+    {'move': 'left', 'sleep': 4},
+    {'move': 'Stop', 'sleep': 3},
+]
+
+current_path_index = 0
+
+model = YOLO('best_augmentation.pt')
+
+
+class SleepingThread(threading.Thread):
+    def __init__(self, sleep_time):
+        super().__init__()
+        self.sleep_time = sleep_time
+        self.done = threading.Event()
+
+    def run(self):
+        self.done.wait(self.sleep_time)
+
+    def stop(self):
+        self.done.set()
+
+
+def move_robot(robot_path):
+    global stop_robot_flag, current_path_index
+    try:
+        loop_counter = 0
+
+        with open("robot_log.txt", "a") as file:
+            while loop_counter < 5:
+                for idx in range(current_path_index, len(robot_path)):
+                    timestamp = datetime.now()
+
+                    if not stop_robot_flag.is_set():
+                        move_operation = robot_path[idx]['move']
+                        sleep_duration = robot_path[idx]['sleep']
+
+                        file.write(f"{timestamp} - Moving: {move_operation}\n")
+                        file.flush()
+                        os.fsync(file.fileno())
+
+                        print(f"Moving: {move_operation}")
+                        sleep_thread = SleepingThread(sleep_duration)
+                        sleep_thread.start()
+                        while sleep_thread.is_alive():
+                            if stop_robot_flag.is_set():
+                                sleep_thread.stop()
+                                sleep_interruption_time = datetime.now()
+                                file.write(f"{sleep_interruption_time} - Stopping Robot.\n")
+                                file.flush()
+                                os.fsync(file.fileno())
+
+                                while stop_robot_flag.is_set():
+                                    time.sleep(0.1)
+                                remaining_sleep = sleep_duration - (datetime.now() - timestamp).seconds
+                                if remaining_sleep > 0:
+                                    time.sleep(remaining_sleep)
+                            sleep_thread.join(timeout=0.1)
+
+                    if not stop_robot_flag.is_set():
+                        timestamp = datetime.now()
+                        file.write(f"{timestamp} - Completed move: {move_operation}\n")
+                        file.flush()
+                        os.fsync(file.fileno())
+                        current_path_index = idx + 1
+                    else:
+                        file.write(f"{timestamp} - Interrupted move: {move_operation}\n")
+                        file.flush()
+                        os.fsync(file.fileno())
+                        break
+
+                if stop_robot_flag.is_set():
+                    file.write(f"{datetime.now()} - Interrupted robot path. Restarting.\n")
+                    stop_robot_flag.clear()
+                else:
+                    file.write(f"{datetime.now()} - End of robot path {loop_counter}\n")
+                    loop_counter += 1
+                    current_path_index = 0
+
+            file.write(f"{datetime.now()} - Completed 5 robot paths.\n")
+    except Exception as e:
+        print(f"Error in move_robot: {e}")
+    finally:
+        print("Automatic robot control stopped")
+        stop_robot_flag.set()
+        ser.write(movement_commands['Stop'])
+        time.sleep(10)
+
+
+def send_image_to_server(image_path, latitude, longitude):
+    url = "https://eightleggedrobot.com/api/saveGPS"
+    try:
+        with open(image_path, 'rb') as image_file:
+            encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
+            payload = {
+                'image': encoded_image,
+                'latitude': latitude,
+                'longitude': longitude
+            }
+            headers = {'Content-Type': 'application/json'}
+            response = requests.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            print(f"Image successfully sent to server: {response.status_code}")
+
+    except Exception as e:
+        print(f"Failed to send image to server: {e}")
+
+
+def get_location_coordinates(address):
+    try:
+        geolocator = Nominatim(user_agent="https://eightleggedrobot.com/")
+        location = geolocator.geocode(address)
+        if location:
+            return location.latitude, location.longitude
+        else:
+            return None, None
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None, None
+
+
+def measure_distance():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(TRIG_PIN, GPIO.OUT)
+    GPIO.setup(ECHO_PIN, GPIO.IN)
+
+    GPIO.output(TRIG_PIN, False)
+    time.sleep(0.1)
+
+    GPIO.output(TRIG_PIN, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG_PIN, False)
+
+    pulse_start = time.time()
+    pulse_end = pulse_start
+    while GPIO.input(ECHO_PIN) == 0:
+        pulse_start = time.time()
+
+    while GPIO.input(ECHO_PIN) == 1:
+        pulse_end = time.time()
+
+    pulse_duration = pulse_end - pulse_start
+    distance = pulse_duration * 17150
+    distance = round(distance, 2)
+
+    GPIO.cleanup()
+
+    if 2 <= distance <= 400:
+        return distance
+    else:
+        return None
+
+
+def object_detection(image_path):
+    try:
+        result = model(image_path, conf=0.25, save=True, exist_ok=True, project='Eight Legged',
+                       name='Predicted Image', verbose=False)
+
+        detected_classes = []
+
+        for r in result[0].boxes:
+            class_name = result[0].names[r.cls[0].item()]
+            detected_classes.append(class_name)
+        return detected_classes
+
+    except Exception as e:
+        print(f"Error during object detection: {e}")
+        return []
+
+
+def manual_control():
+    global previous, stop_manual_flag
+    try:
+        with requests.Session() as session:
+            while not stop_manual_flag.is_set():
+                response = session.get('https://eightleggedrobot.com/getMovement', verify=False, stream=True)
+                response.raise_for_status()
+                movement = response.json().get('current_movement')
+
+                if movement in movement_commands and previous != movement:
+                    print(f"Executing command: {movement}")
+                    ser.write(movement_commands[movement])
+                    previous = movement
+
+    except Exception as e:
+        print(f"Error in manual_control: {e}")
+    finally:
+        ser.write(movement_commands['Stop'])
+        print("Manual control stopped")
+        stop_robot_flag.clear()
+
+
+def automatic_control():
+    global stop_robot_flag, stop_automatic_flag, cap, current_path_index
+
+    cap = cv2.VideoCapture(0)
+
+    frame_counter = 0
+    capture_after_frames = 30
+    counting_frames = False
+    sense = True
+
+    distance = []
+
+    address = "Looc, Balete, Batangas"
+    latitude, longitude = get_location_coordinates(address)
+
+    try:
+        with open("robot_log.txt", "a") as file:
+            while cap.isOpened() and not stop_automatic_flag.is_set():
+                try:
+                    success, frame = cap.read()
+                    if not success:
+                        print("Failed to read frame from camera.")
+                        continue
+
+                    cv2.imshow("Eight Legged", frame)
+
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+
+                    dist = measure_distance()
+
+                    if dist is not None:
+                        if dist <= 30 and sense:
+                            ser.write(movement_commands['Stop'])
+                            stop_robot_flag.set()
+                            distance.append(dist)
+                            sense = False
+                            counting_frames = True
+
+                    if counting_frames and distance and distance[0] <= 30:
+                        frame_counter += 1
+                        stop_robot_flag.set()
+
+                        print("Front", frame_counter)
+
+                        if frame_counter >= capture_after_frames:
+                            image_path = 'predicted_image.jpg'
+                            cv2.imwrite(image_path, frame)
+
+                            detected_classes = object_detection(image_path)
+
+                            if any(class_name in ['CartonBox', 'WaterBottle', 'Wood'] for class_name in
+                                   detected_classes):
+                                stop_robot_flag.set()
+                                send_image_to_server('Eight Legged/Predicted Image/predicted_image.jpg', latitude, longitude)
+                            else:
+                                stop_robot_flag.clear()
+                                sense = True
+                                distance.clear()
+
+                            frame_counter = 0
+                            counting_frames = False
+
+                            if stop_robot_flag.is_set():
+                                timestamp = datetime.now()
+                                log_message = f"{timestamp} - Turning right to check for objects on the right side.\n"
+                                print(log_message.strip())
+                                file.write(log_message)
+                                file.flush()
+                                os.fsync(file.fileno())
+
+                                ser.write(movement_commands['right'])
+                                time.sleep(4)
+
+                                frame_counter = 0
+                                counting_frames = True
+                                while frame_counter < capture_after_frames and cap.isOpened() and not stop_automatic_flag.is_set():
+                                    success, frame = cap.read()
+                                    if not success:
+                                        print("Failed to read frame during right check.")
+                                        continue
+                                    frame_counter += 1
+
+                                    print("Right", frame_counter)
+                                if frame_counter >= capture_after_frames:
+                                    image_path = 'predicted_image.jpg'
+                                    cv2.imwrite(image_path, frame)
+                                    detected_classes = object_detection(image_path)
+
+                                    if not any(class_name in ['CartonBox', 'WaterBottle', 'Wood'] for class_name in
+                                               detected_classes):
+                                        timestamp = datetime.now()
+                                        log_message = f"{timestamp} - No object detected on the right. Resuming original path.\n"
+                                        print(log_message.strip())
+                                        file.write(log_message)
+                                        file.flush()
+                                        os.fsync(file.fileno())
+
+                                        print("Forward")
+                                        ser.write(movement_commands['up'])
+                                        time.sleep(5)
+
+                                        print("Left")
+                                        ser.write(movement_commands['left'])
+                                        time.sleep(4)
+
+                                        print("Forward")
+                                        ser.write(movement_commands['up'])
+                                        time.sleep(5)
+
+                                        print("Left")
+                                        ser.write(movement_commands['left'])
+                                        time.sleep(4)
+
+                                        print("Forward")
+                                        ser.write(movement_commands['up'])
+                                        time.sleep(5)
+
+                                        print("Right")
+                                        ser.write(movement_commands['right'])
+                                        time.sleep(4)
+
+                                        stop_robot_flag.clear()
+                                        sense = True
+                                        distance.clear()
+                                        current_path_index = 0
+                                    else:
+                                        timestamp = datetime.now()
+                                        log_message = f"{timestamp} - Object detected on the right. Checking the left side.\n"
+                                        print(log_message.strip())
+                                        file.write(log_message)
+                                        file.flush()
+                                        os.fsync(file.fileno())
+
+                                        send_image_to_server('Eight Legged/Predicted Image/predicted_image.jpg',
+                                                             latitude, longitude)
+
+                                        ser.write(movement_commands['left'])
+                                        time.sleep(8)
+
+                                        frame_counter = 0
+                                        counting_frames = True
+                                        while frame_counter < capture_after_frames and cap.isOpened() and not stop_automatic_flag.is_set():
+                                            success, frame = cap.read()
+                                            if not success:
+                                                print("Failed to read frame during left check.")
+                                                continue
+                                            frame_counter += 1
+
+                                            print("Left", frame_counter)
+                                        if frame_counter >= capture_after_frames:
+                                            image_path = 'predicted_image.jpg'
+                                            cv2.imwrite(image_path, frame)
+                                            detected_classes = object_detection(image_path)
+
+                                            if not any(
+                                                    class_name in ['CartonBox', 'WaterBottle', 'Wood'] for class_name in
+                                                    detected_classes):
+                                                timestamp = datetime.now()
+                                                log_message = f"{timestamp} - No object detected on the left. Resuming original path.\n"
+                                                print(log_message.strip())
+                                                file.write(log_message)
+                                                file.flush()
+                                                os.fsync(file.fileno())
+
+                                                print("Forward")
+                                                ser.write(movement_commands['up'])
+                                                time.sleep(5)
+
+                                                print("Right")
+                                                ser.write(movement_commands['right'])
+                                                time.sleep(4)
+
+                                                print("Forward")
+                                                ser.write(movement_commands['up'])
+                                                time.sleep(5)
+
+                                                print("Right")
+                                                ser.write(movement_commands['right'])
+                                                time.sleep(4)
+
+                                                print("Forward")
+                                                ser.write(movement_commands['up'])
+                                                time.sleep(5)
+
+                                                print("Left")
+                                                ser.write(movement_commands['left'])
+                                                time.sleep(4)
+
+                                                stop_robot_flag.clear()
+                                                sense = True
+                                                distance.clear()
+                                                current_path_index = 0
+                                            else:
+                                                timestamp = datetime.now()
+                                                log_message = f"{timestamp} - Objects detected on both sides. Stopping the robot.\n"
+                                                print(log_message.strip())
+                                                file.write(log_message)
+                                                file.flush()
+                                                os.fsync(file.fileno())
+
+                                                send_image_to_server('Eight Legged/Predicted Image/predicted_image.jpg',
+                                                                     latitude, longitude)
+
+                                                print("Right")
+                                                ser.write(movement_commands['right'])
+                                                time.sleep(4)
+
+                                                print("Backward")
+                                                ser.write(movement_commands['down'])
+                                                time.sleep(5)
+
+                                                stop_robot_flag.set()
+
+                except Exception as e:
+                    error_message = f"{datetime.now()} - Error during frame processing: {e}\n"
+                    print(error_message.strip())
+                    file.write(error_message)
+                    file.flush()
+                    os.fsync(file.fileno())
+
+    except Exception as e:
+        error_message = f"Error in automatic_control: {e}\n"
+        print(error_message.strip())
+        with open("robot_log.txt", "a") as file:
+            file.write(error_message)
+            file.flush()
+            os.fsync(file.fileno())
+
+    finally:
+        ser.write(movement_commands['Stop'])
+        print("Automatic camera control stopped")
+        stop_robot_flag.set()
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
+
+
+def main():
+    global robot_thread, camera_thread, manual_thread
+
+    while True:
+        try:
+            r = requests.get('https://eightleggedrobot.com/api/getRobotSettings', verify=False, stream=True)
+            res = r.json()
+
+            if res['movement'] == 'manual':
+                if camera_thread and camera_thread.is_alive():
+                    print("Stopping automatic camera control")
+                    stop_automatic_flag.set()
+                    camera_thread.join()
+
+                if not manual_thread or not manual_thread.is_alive():
+                    print("Starting manual control")
+                    stop_manual_flag.clear()
+                    manual_thread = threading.Thread(target=manual_control)
+                    manual_thread.daemon = True
+                    manual_thread.start()
+            else:
+                if manual_thread and manual_thread.is_alive():
+                    print("Stopping manual control")
+                    stop_manual_flag.set()
+                    manual_thread.join()
+
+                if not camera_thread or not camera_thread.is_alive():
+                    print("Starting automatic camera control")
+                    stop_automatic_flag.clear()
+                    camera_thread = threading.Thread(target=automatic_control)
+                    camera_thread.daemon = True
+                    camera_thread.start()
+
+                if not robot_thread or not robot_thread.is_alive():
+                    print("Starting automatic robot control")
+                    stop_robot_flag.clear()
+                    robot_thread = threading.Thread(target=move_robot, args=(robotPath,))
+                    robot_thread.daemon = True
+                    robot_thread.start()
+
+            time.sleep(5)
+
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    stop_manual_flag = threading.Event()
+    stop_automatic_flag = threading.Event()
+    main()
